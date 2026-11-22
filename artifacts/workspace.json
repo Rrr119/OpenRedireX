@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid34488",
+  "B": "/home/dev/feedback/uid34488",
+  "sha": "618fd1da333973953c44261acf1d77db58cfda94",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "devanshbatham",
+    "repo": "OpenRedireX",
+    "sha": "618fd1da333973953c44261acf1d77db58cfda94"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "OpenRedireX",
+    "cloneUrl": "https://github.com/Rrr119/OpenRedireX.git"
+  },
+  "at": "2026-11-22T16:37:48.752Z"
+}

